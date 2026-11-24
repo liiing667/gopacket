@@ -78,7 +78,7 @@ func (o DHCPMsgType) String() string {
 	}
 }
 
-//DHCPMagic is the RFC 2131 "magic cooke" for DHCP.
+// DHCPMagic is the RFC 2131 "magic cooke" for DHCP.
 var DHCPMagic uint32 = 0x63825363
 
 // DHCPv4 contains data for a single DHCP packet.
@@ -128,52 +128,90 @@ func (d *DHCPv4) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error 
 		df.SetTruncated()
 		return fmt.Errorf("DHCPv4 length %d too short", len(data))
 	}
-	d.Options = d.Options[:0]
-	d.Operation = DHCPOp(data[0])
-	d.HardwareType = LinkType(data[1])
-	d.HardwareLen = data[2]
-	d.HardwareOpts = data[3]
-	d.Xid = binary.BigEndian.Uint32(data[4:8])
-	d.Secs = binary.BigEndian.Uint16(data[8:10])
-	d.Flags = binary.BigEndian.Uint16(data[10:12])
-	d.ClientIP = net.IP(data[12:16])
-	d.YourClientIP = net.IP(data[16:20])
-	d.NextServerIP = net.IP(data[20:24])
-	d.RelayAgentIP = net.IP(data[24:28])
-	d.ClientHWAddr = net.HardwareAddr(data[28 : 28+d.HardwareLen])
-	d.ServerName = data[44:108]
-	d.File = data[108:236]
+
+	// Decode into a candidate layer and only publish it once the complete
+	// option chain has been validated.  A failed decode must not leave a
+	// partially populated layer behind (or mutate a layer that is still
+	// referenced by a previously built Packet).
+	candidate := DHCPv4{
+		Operation:    DHCPOp(data[0]),
+		HardwareType: LinkType(data[1]),
+		HardwareLen:  data[2],
+		HardwareOpts: data[3],
+		Xid:          binary.BigEndian.Uint32(data[4:8]),
+		Secs:         binary.BigEndian.Uint16(data[8:10]),
+		Flags:        binary.BigEndian.Uint16(data[10:12]),
+		ClientIP:     net.IP(data[12:16]),
+		YourClientIP: net.IP(data[16:20]),
+		NextServerIP: net.IP(data[20:24]),
+		RelayAgentIP: net.IP(data[24:28]),
+		ServerName:   data[44:108],
+		File:         data[108:236],
+	}
+
+	hardwareLen := int(candidate.HardwareLen)
+	if hardwareLen > 16 {
+		return fmt.Errorf("DHCPv4 hardware address length %d is invalid", hardwareLen)
+	}
+	if 28+hardwareLen > len(data) {
+		df.SetTruncated()
+		return fmt.Errorf("DHCPv4 length %d too short for hardware address length %d", len(data), hardwareLen)
+	}
+	candidate.ClientHWAddr = net.HardwareAddr(data[28 : 28+hardwareLen])
+
 	if binary.BigEndian.Uint32(data[236:240]) != DHCPMagic {
 		return InvalidMagicCookie
 	}
 
 	if len(data) <= 240 {
 		// DHCP Packet could have no option (??)
+		candidate.Contents = data
+		*d = candidate
 		return nil
 	}
 
 	options := data[240:]
+	candidate.Options = make(DHCPOptions, 0, dhcpMinInt(len(options)/2, maxDHCPv4Options))
+	seenSingleton := make(map[DHCPOpt]struct{})
 
 	stop := len(options)
 	start := 0
 	for start < stop {
 		o := DHCPOption{}
 		if err := o.decode(options[start:]); err != nil {
+			df.SetTruncated()
 			return err
 		}
 		if o.Type == DHCPOptEnd {
 			break
 		}
-		d.Options = append(d.Options, o)
 		// Check if the option is a single byte pad
 		if o.Type == DHCPOptPad {
+			if len(candidate.Options) >= maxDHCPv4Options {
+				return DecOptionBudgetExceeded
+			}
+			candidate.Options = append(candidate.Options, o)
 			start++
 		} else {
+			if o.Length == 0 && !dhcpv4OptionAllowsEmptyValue(o.Type) {
+				return DecOptionZeroLength
+			}
+			if dhcpv4OptionIsSingleton(o.Type) {
+				if _, ok := seenSingleton[o.Type]; ok {
+					return DecOptionDuplicate
+				}
+				seenSingleton[o.Type] = struct{}{}
+			}
+			if len(candidate.Options) >= maxDHCPv4Options {
+				return DecOptionBudgetExceeded
+			}
+			candidate.Options = append(candidate.Options, o)
 			start += int(o.Length) + 2
 		}
 	}
 
-	d.Contents = data
+	candidate.Contents = data
+	*d = candidate
 
 	return nil
 }
@@ -330,6 +368,7 @@ const (
 	DHCPOptT2                    DHCPOpt = 59  // 4, uint32
 	DHCPOptClassID               DHCPOpt = 60  // n, []byte
 	DHCPOptClientID              DHCPOpt = 61  // n >=  2, []byte
+	DHCPOptRapidCommit           DHCPOpt = 80  // 0
 	DHCPOptDomainSearch          DHCPOpt = 119 // n, string
 	DHCPOptSIPServers            DHCPOpt = 120 // n, url
 	DHCPOptClasslessStaticRoute  DHCPOpt = 121 //
@@ -468,6 +507,8 @@ func (o DHCPOpt) String() string {
 		return "ClassID"
 	case DHCPOptClientID:
 		return "ClientID"
+	case DHCPOptRapidCommit:
+		return "RapidCommit"
 	case DHCPOptDomainSearch:
 		return "DomainSearch"
 	case DHCPOptClasslessStaticRoute:
@@ -535,12 +576,16 @@ func (o DHCPOption) String() string {
 
 // NewDHCPOption constructs a new DHCPOption with a given type and data.
 func NewDHCPOption(t DHCPOpt, data []byte) DHCPOption {
-	o := DHCPOption{Type: t}
-	if data != nil {
-		o.Data = data
-		o.Length = uint8(len(data))
+	if len(data) == 0 {
+		// A zero-length value is only complete for options that are defined
+		// as carrying no data.  Do not manufacture a seemingly valid
+		// zero-length option for anything else.
+		if dhcpv4OptionAllowsEmptyValue(t) {
+			return DHCPOption{Type: t}
+		}
+		return DHCPOption{}
 	}
-	return o
+	return DHCPOption{Type: t, Length: uint8(len(data)), Data: data}
 }
 
 func (o *DHCPOption) encode(b []byte) error {
@@ -592,4 +637,51 @@ const (
 	DecOptionMalformed = DHCPv4Error("Option is malformed")
 	// InvalidMagicCookie is returned when Magic cookie is missing into BOOTP header
 	InvalidMagicCookie = DHCPv4Error("Bad DHCP header")
+	// DecOptionZeroLength is returned when a data-carrying option has no data.
+	DecOptionZeroLength = DHCPv4Error("DHCP option has zero length")
+	// DecOptionDuplicate is returned when a singleton option appears more than once.
+	DecOptionDuplicate = DHCPv4Error("duplicate singleton DHCP option")
+	// DecOptionBudgetExceeded is returned when an option chain exceeds its budget.
+	DecOptionBudgetExceeded = DHCPv4Error("DHCP option budget exceeded")
 )
+
+// maxDHCPv4Options bounds the number of options materialized for a single
+// DHCPv4 layer.  Common Discover/Offer/Request exchanges use only a handful
+// of options; this limit leaves ample room for legitimate extensions while
+// preventing a short-option flood from producing an unbounded layer.
+const maxDHCPv4Options = 64
+
+func dhcpMinInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// dhcpv4OptionAllowsEmptyValue reports whether an option is defined to carry
+// no value.  Pad and End are encoded as a single byte, while Rapid Commit is
+// a zero-length TLV.
+func dhcpv4OptionAllowsEmptyValue(t DHCPOpt) bool {
+	switch t {
+	case DHCPOptPad, DHCPOptEnd, DHCPOptRapidCommit:
+		return true
+	default:
+		return false
+	}
+}
+
+// dhcpv4OptionIsSingleton reports whether multiple instances of an option
+// have no unambiguous meaning for consumers.
+func dhcpv4OptionIsSingleton(t DHCPOpt) bool {
+	switch t {
+	case DHCPOptSubnetMask, DHCPOptRouter, DHCPOptDNS, DHCPOptHostname,
+		DHCPOptDomainName, DHCPOptBroadcastAddr, DHCPOptRequestIP,
+		DHCPOptLeaseTime, DHCPOptExtOptions, DHCPOptMessageType,
+		DHCPOptServerID, DHCPOptParamsRequest, DHCPOptMaxMessageSize,
+		DHCPOptT1, DHCPOptT2, DHCPOptClientID, DHCPOptRapidCommit,
+		DHCPOptDomainSearch, DHCPOptClasslessStaticRoute:
+		return true
+	default:
+		return false
+	}
+}

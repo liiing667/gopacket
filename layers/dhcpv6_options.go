@@ -586,13 +586,16 @@ func (o DHCPv6Option) String() string {
 
 // NewDHCPv6Option constructs a new DHCPv6Option with a given type and data.
 func NewDHCPv6Option(code DHCPv6Opt, data []byte) DHCPv6Option {
-	o := DHCPv6Option{Code: code}
-	if data != nil {
-		o.Data = data
-		o.Length = uint16(len(data))
+	if len(data) == 0 {
+		// Only options defined without a value may legitimately have a
+		// zero-length encoding.  Do not make an unknown zero-length option
+		// look complete.
+		if dhcpv6OptionAllowsEmptyValue(code) {
+			return DHCPv6Option{Code: code}
+		}
+		return DHCPv6Option{}
 	}
-
-	return o
+	return DHCPv6Option{Code: code, Length: uint16(len(data)), Data: data}
 }
 
 func (o *DHCPv6Option) encode(b []byte, opts gopacket.SerializeOptions) error {

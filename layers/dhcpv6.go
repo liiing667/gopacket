@@ -91,34 +91,56 @@ func (d *DHCPv6) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error 
 		df.SetTruncated()
 		return fmt.Errorf("DHCPv6 length %d too short", len(data))
 	}
-	d.BaseLayer = BaseLayer{Contents: data}
-	d.Options = d.Options[:0]
-	d.MsgType = DHCPv6MsgType(data[0])
+
+	// Decode into a candidate layer and publish it only after the whole
+	// option chain has been validated.
+	candidate := DHCPv6{
+		MsgType: DHCPv6MsgType(data[0]),
+	}
 
 	offset := 0
-	if d.MsgType == DHCPv6MsgTypeRelayForward || d.MsgType == DHCPv6MsgTypeRelayReply {
+	if candidate.MsgType == DHCPv6MsgTypeRelayForward || candidate.MsgType == DHCPv6MsgTypeRelayReply {
 		if len(data) < 34 {
 			df.SetTruncated()
-			return fmt.Errorf("DHCPv6 length %d too short for message type %d", len(data), d.MsgType)
+			return fmt.Errorf("DHCPv6 length %d too short for message type %d", len(data), candidate.MsgType)
 		}
-		d.HopCount = data[1]
-		d.LinkAddr = net.IP(data[2:18])
-		d.PeerAddr = net.IP(data[18:34])
+		candidate.HopCount = data[1]
+		candidate.LinkAddr = net.IP(data[2:18])
+		candidate.PeerAddr = net.IP(data[18:34])
 		offset = 34
 	} else {
-		d.TransactionID = data[1:4]
+		candidate.TransactionID = data[1:4]
 		offset = 4
 	}
+
+	candidate.Options = make(DHCPv6Options, 0, dhcpMinInt((len(data)-offset)/4, maxDHCPv6Options))
+	seenSingleton := make(map[DHCPv6Opt]struct{})
 
 	stop := len(data)
 	for offset < stop {
 		o := DHCPv6Option{}
 		if err := o.decode(data[offset:]); err != nil {
+			df.SetTruncated()
 			return err
 		}
-		d.Options = append(d.Options, o)
+		if o.Length == 0 && !dhcpv6OptionAllowsEmptyValue(o.Code) {
+			return DecOptionZeroLength
+		}
+		if dhcpv6OptionIsSingleton(o.Code) {
+			if _, ok := seenSingleton[o.Code]; ok {
+				return DecOptionDuplicate
+			}
+			seenSingleton[o.Code] = struct{}{}
+		}
+		if len(candidate.Options) >= maxDHCPv6Options {
+			return DecOptionBudgetExceeded
+		}
+		candidate.Options = append(candidate.Options, o)
 		offset += int(o.Length) + 4 // 2 from option code, 2 from option length
 	}
+
+	candidate.Contents = data
+	*d = candidate
 
 	return nil
 }
@@ -181,6 +203,39 @@ func (d *DHCPv6) CanDecode() gopacket.LayerClass {
 // NextLayerType returns the layer type contained by this DecodingLayer.
 func (d *DHCPv6) NextLayerType() gopacket.LayerType {
 	return gopacket.LayerTypePayload
+}
+
+// maxDHCPv6Options bounds the number of options materialized for a single
+// DHCPv6 layer.
+const maxDHCPv6Options = 64
+
+// dhcpv6OptionAllowsEmptyValue reports whether an option is defined to carry
+// no value.
+func dhcpv6OptionAllowsEmptyValue(code DHCPv6Opt) bool {
+	switch code {
+	case DHCPv6OptRapidCommit, DHCPv6OptReconfigureAccept, DHCPv6OptEchoRequestOption:
+		return true
+	default:
+		return false
+	}
+}
+
+// dhcpv6OptionIsSingleton reports whether multiple instances of an option
+// have no unambiguous meaning for consumers.
+func dhcpv6OptionIsSingleton(code DHCPv6Opt) bool {
+	switch code {
+	case DHCPv6OptClientID, DHCPv6OptServerID, DHCPv6OptOro,
+		DHCPv6OptPreference, DHCPv6OptElapsedTime, DHCPv6OptRapidCommit,
+		DHCPv6OptInterfaceID, DHCPv6OptReconfigureMessage,
+		DHCPv6OptReconfigureAccept, DHCPv6OptDNSServers,
+		DHCPv6OptDomainList, DHCPv6OptInformationRefreshTime,
+		DHCPv6OptClientFQDN, DHCPv6OptBootFileURL, DHCPv6OptBootFileParam,
+		DHCPv6OptClientArchType, DHCPv6OptSolMaxRt, DHCPv6OptInfMaxRt,
+		DHCPv6OptMUDURLV6:
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeDHCPv6(data []byte, p gopacket.PacketBuilder) error {
