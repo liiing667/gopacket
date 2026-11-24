@@ -43,6 +43,7 @@ var debugLog = flag.Bool("assembly_debug_log", defaultDebug, "If true, the githu
 
 const invalidSequence = -1
 const uint32Max = 0xFFFFFFFF
+const uint32Size = 1 << 32
 
 // Sequence is a TCP sequence number.  It provides a few convenience functions
 // for handling TCP wrap-around.  The sequence should always be in the range
@@ -63,9 +64,9 @@ type Sequence int64
 // wrapping the uint32 space.
 func (s Sequence) Difference(t Sequence) int {
 	if s > uint32Max-uint32Max/4 && t < uint32Max/4 {
-		t += uint32Max
+		t += uint32Size
 	} else if t > uint32Max-uint32Max/4 && s < uint32Max/4 {
-		s += uint32Max
+		s += uint32Size
 	}
 	return int(t - s)
 }
@@ -1199,11 +1200,31 @@ func (a *Assembler) closeHalfConnection(conn *connection, half *halfconnection) 
 	if *debugLog {
 		log.Printf("%v closing", conn)
 	}
+	if half.closed {
+		return
+	}
 	half.closed = true
-	for p := half.first; p != nil; p = p.next {
-		// FIXME: it should be already empty
-		a.pc.replace(p)
-		half.pages--
+	// Release every page still owned by this half.  Clear the list before
+	// releasing pages: pageCache.replace resets page links, so walking p.next
+	// after release would drop the rest of the list and leave half.first
+	// pointing at a page that is already back in the cache.
+	for p := half.first; p != nil; {
+		next := p.next
+		half.pages -= p.release(a.pc)
+		p = next
+	}
+	half.first, half.last = nil, nil
+	// Kept pages are still owned by the half until it closes, too.  Releasing
+	// them here prevents old segments from being resurrected if the connection
+	// or its pages are ever reused.
+	for p := half.saved; p != nil; {
+		next := p.next
+		half.pages -= p.release(a.pc)
+		p = next
+	}
+	half.saved = nil
+	if half.pages < 0 {
+		half.pages = 0
 	}
 	if conn.s2c.closed && conn.c2s.closed {
 		if half.stream.ReassemblyComplete(nil) { //FIXME: which context to pass ?
@@ -1276,10 +1297,10 @@ func (a *Assembler) FlushWithOptions(opt FlushOptions) (flushed, closed int) {
 		if conn.s2c.closed && conn.c2s.closed && conn.s2c.lastSeen.Before(opt.TC) && conn.c2s.lastSeen.Before(opt.TC) {
 			remove = true
 		}
-		conn.mu.Unlock()
 		if remove {
 			a.connPool.remove(conn)
 		}
+		conn.mu.Unlock()
 	}
 	return flushes, closes
 }

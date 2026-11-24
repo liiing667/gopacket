@@ -89,26 +89,12 @@ type StreamPool struct {
 	conns              map[key]*connection
 	users              int
 	mu                 sync.RWMutex
+	createMu           sync.Mutex
 	factory            StreamFactory
-	free               []*connection
-	all                [][]connection
-	nextAlloc          int
 	newConnectionCount int64
 }
 
 const initialAllocSize = 1024
-
-func (p *StreamPool) grow() {
-	conns := make([]connection, p.nextAlloc)
-	p.all = append(p.all, conns)
-	for i := range conns {
-		p.free = append(p.free, &conns[i])
-	}
-	if *memLog {
-		log.Println("StreamPool: created", p.nextAlloc, "new connections")
-	}
-	p.nextAlloc *= 2
-}
 
 // Dump logs all connections
 func (p *StreamPool) Dump() {
@@ -120,11 +106,16 @@ func (p *StreamPool) Dump() {
 	}
 }
 
+// remove deletes conn from the pool, but only if conn is still the connection
+// currently registered for its key.  A connection that was already removed
+// (or whose key was re-used by another connection) must never be allowed to
+// remove the current owner of that key.  Otherwise a late flush or a stale
+// stream teardown could resurrect a recycled connection and feed its old
+// segments to a different stream.
 func (p *StreamPool) remove(conn *connection) {
 	p.mu.Lock()
-	if _, ok := p.conns[conn.key]; ok {
+	if cur, ok := p.conns[conn.key]; ok && cur == conn {
 		delete(p.conns, conn.key)
-		p.free = append(p.free, conn)
 	}
 	p.mu.Unlock()
 }
@@ -133,10 +124,8 @@ func (p *StreamPool) remove(conn *connection) {
 // be created as necessary using the passed-in StreamFactory.
 func NewStreamPool(factory StreamFactory) *StreamPool {
 	return &StreamPool{
-		conns:     make(map[key]*connection, initialAllocSize),
-		free:      make([]*connection, 0, initialAllocSize),
-		factory:   factory,
-		nextAlloc: initialAllocSize,
+		conns:   make(map[key]*connection, initialAllocSize),
+		factory: factory,
 	}
 }
 
@@ -154,14 +143,15 @@ func (p *StreamPool) newConnection(k key, s Stream, ts time.Time) (c *connection
 	if *memLog {
 		p.newConnectionCount++
 		if p.newConnectionCount&0x7FFF == 0 {
-			log.Println("StreamPool:", p.newConnectionCount, "requests,", len(p.conns), "used,", len(p.free), "free")
+			log.Println("StreamPool:", p.newConnectionCount, "requests,", len(p.conns), "used")
 		}
 	}
-	if len(p.free) == 0 {
-		p.grow()
-	}
-	index := len(p.free) - 1
-	c, p.free = p.free[index], p.free[:index]
+	// Connection objects are never re-used.  A stale Assembler or flusher can
+	// hold a *connection after it has left the pool, so handing that object to
+	// a new flow would let old state (and old queued pages) leak into the new
+	// stream.  A fresh object per flow keeps each stream tied to exactly one
+	// network flow identity.
+	c = new(connection)
 	c.reset(k, s, ts)
 	return c, &c.c2s, &c.s2c
 }
@@ -189,18 +179,25 @@ func (p *StreamPool) getConnection(k key, end bool, ts time.Time, tcp *layers.TC
 	if end || conn != nil {
 		return conn, half, rev
 	}
+
+	// Serialize creation so that two assemblers can't both create a stream
+	// for the same flow (in either direction).  The lookup below is repeated
+	// under createMu because the reverse direction may have been inserted
+	// while we were waiting.
+	p.createMu.Lock()
+	defer p.createMu.Unlock()
+
+	p.mu.RLock()
+	conn, half, rev = p.getHalf(k)
+	p.mu.RUnlock()
+	if conn != nil {
+		return conn, half, rev
+	}
+
 	s := p.factory.New(k[0], k[1], tcp, ac)
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	conn, half, rev = p.newConnection(k, s, ts)
-	conn2, half2, rev2 := p.getHalf(k)
-	if conn2 != nil {
-		if conn2.key != k {
-			panic("FIXME: other dir added in the meantime...")
-		}
-		// FIXME: delete s ?
-		return conn2, half2, rev2
-	}
 	p.conns[k] = conn
+	p.mu.Unlock()
 	return conn, half, rev
 }

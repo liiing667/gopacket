@@ -311,33 +311,17 @@ type StreamPool struct {
 	conns              map[key]*connection
 	users              int
 	mu                 sync.RWMutex
+	createMu           sync.Mutex
 	factory            StreamFactory
-	free               []*connection
-	all                [][]connection
-	nextAlloc          int
 	newConnectionCount int64
-}
-
-func (p *StreamPool) grow() {
-	conns := make([]connection, p.nextAlloc)
-	p.all = append(p.all, conns)
-	for i := range conns {
-		p.free = append(p.free, &conns[i])
-	}
-	if *memLog {
-		log.Println("StreamPool: created", p.nextAlloc, "new connections")
-	}
-	p.nextAlloc *= 2
 }
 
 // NewStreamPool creates a new connection pool.  Streams will
 // be created as necessary using the passed-in StreamFactory.
 func NewStreamPool(factory StreamFactory) *StreamPool {
 	return &StreamPool{
-		conns:     make(map[key]*connection, initialAllocSize),
-		free:      make([]*connection, 0, initialAllocSize),
-		factory:   factory,
-		nextAlloc: initialAllocSize,
+		conns:   make(map[key]*connection, initialAllocSize),
+		factory: factory,
 	}
 }
 
@@ -477,14 +461,14 @@ func (p *StreamPool) newConnection(k key, s Stream, ts time.Time) (c *connection
 	if *memLog {
 		p.newConnectionCount++
 		if p.newConnectionCount&0x7FFF == 0 {
-			log.Println("StreamPool:", p.newConnectionCount, "requests,", len(p.conns), "used,", len(p.free), "free")
+			log.Println("StreamPool:", p.newConnectionCount, "requests,", len(p.conns), "used")
 		}
 	}
-	if len(p.free) == 0 {
-		p.grow()
-	}
-	index := len(p.free) - 1
-	c, p.free = p.free[index], p.free[:index]
+	// Connection objects are never re-used.  A stale Assembler or flusher may
+	// still hold a *connection after it left the pool; re-using that object for
+	// another flow would let buffered pages from the old flow be emitted into
+	// the new stream.
+	c = new(connection)
 	c.reset(k, s, ts)
 	return c
 }
@@ -499,13 +483,21 @@ func (p *StreamPool) getConnection(k key, end bool, ts time.Time) *connection {
 	if end || conn != nil {
 		return conn
 	}
+
+	// Only one goroutine may create a connection for this key at a time.
+	p.createMu.Lock()
+	defer p.createMu.Unlock()
+
+	p.mu.RLock()
+	conn = p.conns[k]
+	p.mu.RUnlock()
+	if conn != nil {
+		return conn
+	}
+
 	s := p.factory.New(k[0], k[1])
 	p.mu.Lock()
 	conn = p.newConnection(k, s, ts)
-	if conn2 := p.conns[k]; conn2 != nil {
-		p.mu.Unlock()
-		return conn2
-	}
 	p.conns[k] = conn
 	p.mu.Unlock()
 	return conn
@@ -658,8 +650,9 @@ func (a *Assembler) skipFlush(conn *connection) {
 
 func (p *StreamPool) remove(conn *connection) {
 	p.mu.Lock()
-	delete(p.conns, conn.key)
-	p.free = append(p.free, conn)
+	if cur, ok := p.conns[conn.key]; ok && cur == conn {
+		delete(p.conns, conn.key)
+	}
 	p.mu.Unlock()
 }
 
@@ -667,12 +660,18 @@ func (a *Assembler) closeConnection(conn *connection) {
 	if *debugLog {
 		log.Printf("%v closing", conn.key)
 	}
-	conn.stream.ReassemblyComplete()
 	conn.closed = true
-	a.connPool.remove(conn)
-	for p := conn.first; p != nil; p = p.next {
+	conn.stream.ReassemblyComplete()
+	// Drop all buffered pages before removing the connection from the pool.
+	// The pages must never be observable by, or delivered to, another stream.
+	for p := conn.first; p != nil; {
+		next := p.next
 		a.pc.replace(p)
+		p = next
 	}
+	conn.first, conn.last = nil, nil
+	conn.pages = 0
+	a.connPool.remove(conn)
 }
 
 // traverseConn traverses our doubly-linked list of pages for the correct
