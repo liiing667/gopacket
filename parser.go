@@ -300,10 +300,14 @@ func (l *DecodingLayerParser) SetDecodingLayerContainer(dlc DecodingLayerContain
 // If DecodeLayers is unable to decode the next layer type, it will return the
 // error UnsupportedLayerType.
 func (l *DecodingLayerParser) DecodeLayers(data []byte, decoded *[]LayerType) (err error) {
-	l.Truncated = false
 	if !l.IgnorePanic {
 		defer panicToError(&err)
 	}
+	l.Truncated = false
+	// Most decode functions truncate decoded themselves, but the function
+	// returned for a missing first decoder does not. Reset at the public
+	// entry point so every packet starts from an empty candidate slice.
+	*decoded = (*decoded)[:0]
 	typ, err := l.decodeFunc(data, decoded)
 	if typ != LayerTypeZero {
 		// no decoder
