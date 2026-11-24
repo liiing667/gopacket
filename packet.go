@@ -130,6 +130,15 @@ func (p *packet) SetTruncated() {
 	p.metadata.Truncated = true
 }
 
+// addTruncatedError binds the truncation marker to the packet's error stack.
+// It is called after decoding has reached a commit boundary, so a decoder's
+// more specific error and layer ordering are preserved.
+func (p *packet) addTruncatedError() {
+	if p.metadata.Truncated && p.failure == nil {
+		p.addFinalDecodeError(errTruncated, nil)
+	}
+}
+
 func (p *packet) SetLinkLayer(l LinkLayer) {
 	if p.link == nil {
 		p.link = l
@@ -183,6 +192,9 @@ func (p *packet) DecodeOptions() *DecodeOptions {
 }
 
 func (p *packet) addFinalDecodeError(err error, stack []byte) {
+	if err == nil {
+		return
+	}
 	fail := &DecodeFailure{err: err, stack: stack}
 	if p.last == nil {
 		fail.data = p.data
@@ -434,6 +446,10 @@ type eagerPacket struct {
 
 var errNilDecoder = errors.New("NextDecoder passed nil decoder, probably an unsupported decode type")
 
+// errTruncated is used when a decoder reports truncation without a more
+// specific decoding error.
+var errTruncated = errors.New("packet data is truncated")
+
 func (p *eagerPacket) NextDecoder(next Decoder) error {
 	if next == nil {
 		return errNilDecoder
@@ -453,6 +469,8 @@ func (p *eagerPacket) initialDecode(dec Decoder) {
 	err := dec.Decode(p.data, p)
 	if err != nil {
 		p.addFinalDecodeError(err, nil)
+	} else {
+		p.addTruncatedError()
 	}
 }
 func (p *eagerPacket) LinkLayer() LinkLayer {
@@ -521,12 +539,15 @@ func (p *lazyPacket) decodeNextLayer() {
 	// We've just set p.next to nil, so if we see we have no data, this should be
 	// the final call we get to decodeNextLayer if we return here.
 	if len(d) == 0 {
+		p.addTruncatedError()
 		return
 	}
 	defer p.recoverDecodeError()
 	err := next.Decode(d, p)
 	if err != nil {
 		p.addFinalDecodeError(err, nil)
+	} else if p.next == nil {
+		p.addTruncatedError()
 	}
 }
 func (p *lazyPacket) LinkLayer() LinkLayer {
@@ -557,12 +578,14 @@ func (p *lazyPacket) ErrorLayer() ErrorLayer {
 	for p.failure == nil && p.next != nil {
 		p.decodeNextLayer()
 	}
+	p.addTruncatedError()
 	return p.failure
 }
 func (p *lazyPacket) Layers() []Layer {
 	for p.next != nil {
 		p.decodeNextLayer()
 	}
+	p.addTruncatedError()
 	return p.layers
 }
 func (p *lazyPacket) Layer(t LayerType) Layer {
@@ -652,6 +675,14 @@ var DecodeStreamsAsDatagrams = DecodeOptions{DecodeStreamsAsDatagrams: true}
 // firstLayerDecoder tells it how to interpret the first layer from the bytes,
 // future layers will be generated from that first layer automatically.
 func NewPacket(data []byte, firstLayerDecoder Decoder, options DecodeOptions) Packet {
+	return newPacket(data, firstLayerDecoder, options, PacketMetadata{})
+}
+
+// newPacket is the shared construction boundary for public callers and
+// PacketSource.  PacketSource passes capture metadata before eager decoding so
+// capture truncation and any resulting DecodeFailure are owned by the same
+// packet.
+func newPacket(data []byte, firstLayerDecoder Decoder, options DecodeOptions, metadata PacketMetadata) Packet {
 	if !options.NoCopy {
 		dataCopy := make([]byte, len(data))
 		copy(dataCopy, data)
@@ -659,7 +690,7 @@ func NewPacket(data []byte, firstLayerDecoder Decoder, options DecodeOptions) Pa
 	}
 	if options.Lazy {
 		p := &lazyPacket{
-			packet: packet{data: data, decodeOptions: options},
+			packet: packet{data: data, metadata: metadata, decodeOptions: options},
 			next:   firstLayerDecoder,
 		}
 		p.layers = p.initialLayers[:0]
@@ -676,7 +707,7 @@ func NewPacket(data []byte, firstLayerDecoder Decoder, options DecodeOptions) Pa
 		return p
 	}
 	p := &eagerPacket{
-		packet: packet{data: data, decodeOptions: options},
+		packet: packet{data: data, metadata: metadata, decodeOptions: options},
 	}
 	p.layers = p.initialLayers[:0]
 	p.initialDecode(firstLayerDecoder)
@@ -802,10 +833,9 @@ func (p *PacketSource) NextPacket() (Packet, error) {
 	if err != nil {
 		return nil, err
 	}
-	packet := NewPacket(data, p.decoder, p.DecodeOptions)
-	m := packet.Metadata()
-	m.CaptureInfo = ci
-	m.Truncated = m.Truncated || ci.CaptureLength < ci.Length
+	metadata := PacketMetadata{CaptureInfo: ci}
+	metadata.Truncated = ci.CaptureLength < ci.Length
+	packet := newPacket(data, p.decoder, p.DecodeOptions, metadata)
 	return packet, nil
 }
 
