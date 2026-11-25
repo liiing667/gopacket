@@ -300,14 +300,35 @@ func decodeDNS(data []byte, p gopacket.PacketBuilder) error {
 	return nil
 }
 
+// IsResponse reports whether the DNS QR bit identifies this message as a
+// response.
+func (d *DNS) IsResponse() bool {
+	return d != nil && d.QR
+}
+
 // DecodeFromBytes decodes the slice into the DNS struct.
-func (d *DNS) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
-	d.buffer = d.buffer[:0]
+func (d *DNS) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) (err error) {
+	defer func() {
+		if err != nil && d != nil {
+			// Do not leave a partially decoded layer on a reusable decoder.
+			// decodeDNS likewise withholds AddLayer until this method returns
+			// nil, so a bad message never becomes a published DNS layer.
+			*d = DNS{}
+		}
+	}()
 
 	if len(data) < 12 {
 		df.SetTruncated()
 		return errDNSPacketTooShort
 	}
+
+	qdCount := binary.BigEndian.Uint16(data[4:6])
+	anCount := binary.BigEndian.Uint16(data[6:8])
+	nsCount := binary.BigEndian.Uint16(data[8:10])
+	arCount := binary.BigEndian.Uint16(data[10:12])
+
+	d.buffer = d.buffer[:0]
+	budget := newDNSDecodeBudget(&d.buffer)
 
 	// since there are no further layers, the baselayer's content is
 	// pointing to this layer
@@ -321,10 +342,10 @@ func (d *DNS) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
 	d.RA = data[3]&0x80 != 0
 	d.Z = uint8(data[3]>>4) & 0x7
 	d.ResponseCode = DNSResponseCode(data[3] & 0xF)
-	d.QDCount = binary.BigEndian.Uint16(data[4:6])
-	d.ANCount = binary.BigEndian.Uint16(data[6:8])
-	d.NSCount = binary.BigEndian.Uint16(data[8:10])
-	d.ARCount = binary.BigEndian.Uint16(data[10:12])
+	d.QDCount = qdCount
+	d.ANCount = anCount
+	d.NSCount = nsCount
+	d.ARCount = arCount
 
 	d.Questions = d.Questions[:0]
 	d.Answers = d.Answers[:0]
@@ -332,8 +353,10 @@ func (d *DNS) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
 	d.Additionals = d.Additionals[:0]
 
 	offset := 12
-	var err error
 	for i := 0; i < int(d.QDCount); i++ {
+		if i >= maxDNSQuestions {
+			return errDNSRecordCountTooLarge
+		}
 		var q DNSQuestion
 		if offset, err = q.decode(data, offset, df, &d.buffer); err != nil {
 			return err
@@ -354,6 +377,9 @@ func (d *DNS) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
 	// already in the slice, there's no WAY it can escape... on the other hand our
 	// code is MUCH uglier :(
 	for i := 0; i < int(d.ANCount); i++ {
+		if !budget.reserveRecord() {
+			return errDNSRecordCountTooLarge
+		}
 		d.Answers = append(d.Answers, DNSResourceRecord{})
 		if offset, err = d.Answers[i].decode(data, offset, df, &d.buffer); err != nil {
 			d.Answers = d.Answers[:i] // strip off erroneous value
@@ -361,6 +387,9 @@ func (d *DNS) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
 		}
 	}
 	for i := 0; i < int(d.NSCount); i++ {
+		if !budget.reserveRecord() {
+			return errDNSRecordCountTooLarge
+		}
 		d.Authorities = append(d.Authorities, DNSResourceRecord{})
 		if offset, err = d.Authorities[i].decode(data, offset, df, &d.buffer); err != nil {
 			d.Authorities = d.Authorities[:i] // strip off erroneous value
@@ -368,6 +397,9 @@ func (d *DNS) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
 		}
 	}
 	for i := 0; i < int(d.ARCount); i++ {
+		if !budget.reserveRecord() {
+			return errDNSRecordCountTooLarge
+		}
 		d.Additionals = append(d.Additionals, DNSResourceRecord{})
 		if offset, err = d.Additionals[i].decode(data, offset, df, &d.buffer); err != nil {
 			d.Additionals = d.Additionals[:i] // strip off erroneous value
@@ -377,6 +409,10 @@ func (d *DNS) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
 		if d.Additionals[i].Type == DNSTypeOPT {
 			d.ResponseCode = DNSResponseCode(uint8(d.ResponseCode) | uint8(d.Additionals[i].TTL>>20&0xF0))
 		}
+	}
+
+	if offset != len(data) {
+		return errDNSTrailingData
 	}
 
 	if uint16(len(d.Questions)) != d.QDCount {
@@ -533,81 +569,123 @@ func (d *DNS) SerializeTo(b gopacket.SerializeBuffer, opts gopacket.SerializeOpt
 	return nil
 }
 
-const maxRecursionLevel = 255
+const (
+	maxRecursionLevel = 255
+	// maxDNSNameExpansion bounds the dot-prefixed presentation form built for
+	// one name. It matches the historical 255-octet name budget while also
+	// counting bytes reached through compression pointers.
+	maxDNSNameExpansion = 255
+	// maxDNSQuestions and maxDNSRecords are deliberately smaller than the
+	// 16-bit header counters. A DNS message that needs more entries than this
+	// is outside the resource budget granted to an untrusted decoder. The RR
+	// budget is shared by answer, authority, and additional sections.
+	maxDNSQuestions = 4096
+	maxDNSRecords   = 4096
+	// maxDNSDecodeBuffer bounds all names expanded for one DNS message.
+	maxDNSDecodeBuffer = 4 << 20
+)
+
+// dnsDecodeBudget is the shared resource budget for one DNS.DecodeFromBytes
+// call. In addition to the aggregate buffer limit, each name decode tracks
+// compression-pointer targets so a pointer cycle terminates immediately.
+type dnsDecodeBudget struct {
+	buffer  *[]byte
+	records int
+}
+
+func newDNSDecodeBudget(buffer *[]byte) *dnsDecodeBudget {
+	return &dnsDecodeBudget{buffer: buffer}
+}
+
+func (b *dnsDecodeBudget) reserveRecord() bool {
+	if b.records >= maxDNSRecords {
+		return false
+	}
+	b.records++
+	return true
+}
 
 func decodeName(data []byte, offset int, buffer *[]byte, level int) ([]byte, int, error) {
+	return newDNSDecodeBudget(buffer).decodeName(data, offset, level)
+}
+
+func (b *dnsDecodeBudget) decodeName(data []byte, offset int, level int) ([]byte, int, error) {
 	if level > maxRecursionLevel {
 		return nil, 0, errMaxRecursion
-	} else if offset >= len(data) {
-		return nil, 0, errDNSNameOffsetTooHigh
 	} else if offset < 0 {
 		return nil, 0, errDNSNameOffsetNegative
+	} else if offset >= len(data) {
+		return nil, 0, errDNSNameOffsetTooHigh
 	}
+
+	buffer := b.buffer
 	start := len(*buffer)
 	index := offset
-	if data[index] == 0x00 {
-		return nil, index + 1, nil
-	}
-loop:
-	for data[index] != 0x00 {
-		switch data[index] & 0xc0 {
+	// pointerEnd is the first offset after the compression pointer that ended
+	// the externally visible name encoding. Labels reached through the pointer
+	// do not change the caller's parse cursor.
+	pointerEnd := -1
+	pointerHops := level - 1
+	visitedPointers := map[int]struct{}{offset: {}}
+
+	for {
+		if index < 0 {
+			return nil, 0, errDNSNameOffsetNegative
+		}
+		if index >= len(data) {
+			return nil, 0, errDNSIndexOutOfRange
+		}
+
+		length := data[index]
+		if length == 0x00 {
+			index++
+			break
+		}
+
+		switch length & 0xc0 {
 		default:
-			/* RFC 1035
-			   A domain name represented as a sequence of labels, where
-			   each label consists of a length octet followed by that
-			   number of octets.  The domain name terminates with the
-			   zero length octet for the null label of the root.  Note
-			   that this field may be an odd number of octets; no
-			   padding is used.
-			*/
-			index2 := index + int(data[index]) + 1
-			if index2-offset > 255 {
-				return nil, 0, errDNSNameTooLong
-			} else if index2 < index+1 || index2 > len(data) {
+			/* RFC 1035: ordinary label. The top two bits are 00, so length is 0..63. */
+			labelLen := int(length)
+			next := index + 1 + labelLen
+			if next < index+1 || next > len(data) {
 				return nil, 0, errDNSNameInvalidIndex
 			}
+			if len(*buffer)-start+1+labelLen > maxDNSNameExpansion {
+				return nil, 0, errDNSNameTooLong
+			}
+			if len(*buffer)+1+labelLen > maxDNSDecodeBuffer {
+				return nil, 0, errDNSNameTooLong
+			}
+
 			*buffer = append(*buffer, '.')
-			*buffer = append(*buffer, data[index+1:index2]...)
-			index = index2
+			*buffer = append(*buffer, data[index+1:next]...)
+			index = next
 
 		case 0xc0:
-			/* RFC 1035
-			   The pointer takes the form of a two octet sequence.
-
-			   The first two bits are ones.  This allows a pointer to
-			   be distinguished from a label, since the label must
-			   begin with two zero bits because labels are restricted
-			   to 63 octets or less.  (The 10 and 01 combinations are
-			   reserved for future use.)  The OFFSET field specifies
-			   an offset from the start of the message (i.e., the
-			   first octet of the ID field in the domain header).  A
-			   zero offset specifies the first byte of the ID field,
-			   etc.
-
-			   The compression scheme allows a domain name in a message to be
-			   represented as either:
-			      - a sequence of labels ending in a zero octet
-			      - a pointer
-			      - a sequence of labels ending with a pointer
-			*/
+			/* RFC 1035 compression pointer. */
 			if index+2 > len(data) {
 				return nil, 0, errDNSPointerOffsetTooHigh
 			}
-			offsetp := int(binary.BigEndian.Uint16(data[index:index+2]) & 0x3fff)
-			if offsetp > len(data) {
+			pointerOffset := int(binary.BigEndian.Uint16(data[index:index+2]) & 0x3fff)
+			if pointerOffset < 0 || pointerOffset > len(data) {
 				return nil, 0, errDNSPointerOffsetTooHigh
 			}
-			// This looks a little tricky, but actually isn't.  Because of how
-			// decodeName is written, calling it appends the decoded name to the
-			// current buffer.  We already have the start of the buffer, then, so
-			// once this call is done buffer[start:] will contain our full name.
-			_, _, err := decodeName(data, offsetp, buffer, level+1)
-			if err != nil {
-				return nil, 0, err
+			if pointerOffset == len(data) {
+				return nil, 0, errDNSNameOffsetTooHigh
 			}
-			index++ // pointer is two bytes, so add an extra byte here.
-			break loop
-		/* EDNS, or other DNS option ? */
+			if _, ok := visitedPointers[pointerOffset]; ok {
+				return nil, 0, errMaxRecursion
+			}
+			visitedPointers[pointerOffset] = struct{}{}
+			pointerHops++
+			if pointerHops > maxRecursionLevel {
+				return nil, 0, errMaxRecursion
+			}
+			if pointerEnd < 0 {
+				pointerEnd = index + 2
+			}
+			index = pointerOffset
+
 		case 0x40: // RFC 2673
 			return nil, 0, fmt.Errorf("qname '0x40' - RFC 2673 unsupported yet (data=%x index=%d)",
 				data[index], index)
@@ -616,14 +694,16 @@ loop:
 			return nil, 0, fmt.Errorf("qname '0x80' unsupported yet (data=%x index=%d)",
 				data[index], index)
 		}
-		if index >= len(data) {
-			return nil, 0, errDNSIndexOutOfRange
-		}
+	}
+
+	end := index
+	if pointerEnd >= 0 {
+		end = pointerEnd
 	}
 	if len(*buffer) <= start {
-		return (*buffer)[start:], index + 1, nil
+		return (*buffer)[start:], end, nil
 	}
-	return (*buffer)[start+1:], index + 1, nil
+	return (*buffer)[start+1:], end, nil
 }
 
 // DNSQuestion wraps a single request (question) within a DNS query.
@@ -1096,6 +1176,8 @@ var (
 	errDNSPointerOffsetTooHigh = errors.New("dns offset pointer too high")
 	errDNSIndexOutOfRange      = errors.New("dns index walked out of range")
 	errDNSNameHasNoData        = errors.New("no dns data found for name")
+	errDNSRecordCountTooLarge  = errors.New("dns record count exceeds decode budget")
+	errDNSTrailingData         = errors.New("trailing DNS data after complete message")
 
 	errCharStringMissData = errors.New("Insufficient data for a <character-string>")
 
